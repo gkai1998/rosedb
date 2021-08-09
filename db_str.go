@@ -2,11 +2,13 @@ package rosedb
 
 import (
 	"bytes"
-	"github.com/roseduan/rosedb/index"
-	"github.com/roseduan/rosedb/storage"
+	// "errors"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/roseduan/rosedb/index"
+	"github.com/roseduan/rosedb/storage"
 )
 
 // StrIdx string index.
@@ -51,12 +53,16 @@ func (db *RoseDB) SetEx(key, value []byte, duration int64) (err error) {
 
 	deadline := time.Now().Unix() + duration
 	e := storage.NewEntryWithExpire(key, value, deadline, String, StringExpire)
-	if err = db.store(e); err != nil {
-		return
+	err = db.manager.WriteEntry(e)
+	if err != nil {
+		return err
 	}
+	// if err = db.store(e); err != nil {
+	// 	return
+	// }
 
 	// set String index info, stored at skip list.
-	db.setIndexer(e)
+	// db.setIndexer(e)
 	// set expired info.
 	db.expires[String][string(key)] = deadline
 	return
@@ -67,11 +73,20 @@ func (db *RoseDB) Get(key []byte) ([]byte, error) {
 	if err := db.checkKeyValue(key, nil); err != nil {
 		return nil, err
 	}
-
-	db.strIndex.mu.RLock()
-	defer db.strIndex.mu.RUnlock()
-
-	return db.getVal(key)
+	exist, en := db.manager.IsInBuffer(key)
+	if exist {
+		mark := en.GetMark()
+		if mark == StringRem {
+			return nil, ErrKeyNotExist
+		}
+		return en.Meta.Value, nil
+	}
+	// return db.getVal(key)
+	e, err := db.getEntryVal(key)
+	if err != nil {
+		return nil, err
+	}
+	return e.Meta.Value, nil
 }
 
 // GetSet set key to value and returns the old value stored at key.
@@ -118,10 +133,13 @@ func (db *RoseDB) StrExists(key []byte) bool {
 		return false
 	}
 
+	exist, _ := db.manager.IsInBuffer(key)
+	if exist && !db.checkExpired(key, String) {
+		return true
+	}
 	db.strIndex.mu.RLock()
 	defer db.strIndex.mu.RUnlock()
-
-	exist := db.strIndex.idxList.Exist(key)
+	exist = db.strIndex.idxList.Exist(key)
 	if exist && !db.checkExpired(key, String) {
 		return true
 	}
@@ -138,11 +156,14 @@ func (db *RoseDB) Remove(key []byte) error {
 	defer db.strIndex.mu.Unlock()
 
 	e := storage.NewEntryNoExtra(key, nil, String, StringRem)
-	if err := db.store(e); err != nil {
-		return err
+	// if err := db.store(e); err != nil {
+	// 	return err
+	// }
+	db.manager.WriteEntry(e)
+	exist, _ := db.manager.IsInBuffer(key)
+	if !exist {
+		db.strIndex.idxList.Remove(key)
 	}
-
-	db.strIndex.idxList.Remove(key)
 	delete(db.expires[String], string(key))
 	return nil
 }
@@ -151,6 +172,7 @@ func (db *RoseDB) Remove(key []byte) error {
 // limit and offset control the range of value.
 // if limit is negative, all matched values will return.
 func (db *RoseDB) PrefixScan(prefix string, limit, offset int) (val [][]byte, err error) {
+	db.manager.FlushAllEntry()
 	if limit == 0 {
 		return
 	}
@@ -202,6 +224,7 @@ func (db *RoseDB) PrefixScan(prefix string, limit, offset int) (val [][]byte, er
 
 // RangeScan find range of values from start to end.
 func (db *RoseDB) RangeScan(start, end []byte) (val [][]byte, err error) {
+	db.manager.FlushAllEntry()
 	node := db.strIndex.idxList.Get(start)
 
 	db.strIndex.mu.RLock()
@@ -245,10 +268,13 @@ func (db *RoseDB) Expire(key []byte, duration int64) (err error) {
 
 	deadline := time.Now().Unix() + duration
 	e := storage.NewEntryWithExpire(key, value, deadline, String, StringExpire)
-	if err = db.store(e); err != nil {
-		return err
+	// if err = db.store(e); err != nil {
+	// 	return err
+	// }
+	err = db.manager.WriteEntry(e)
+	if err != nil {
+		return nil
 	}
-
 	db.expires[String][string(key)] = deadline
 	return
 }
@@ -264,10 +290,13 @@ func (db *RoseDB) Persist(key []byte) (err error) {
 	defer db.strIndex.mu.Unlock()
 
 	e := storage.NewEntryNoExtra(key, val, String, StringPersist)
-	if err = db.store(e); err != nil {
-		return
+	// if err = db.store(e); err != nil {
+	// 	return
+	// }
+	err = db.manager.WriteEntry(e)
+	if err != nil {
+		return nil
 	}
-
 	delete(db.expires[String], string(key))
 	return
 }
@@ -300,20 +329,20 @@ func (db *RoseDB) setVal(key, value []byte) (err error) {
 		}
 	}
 
-	db.strIndex.mu.Lock()
-	defer db.strIndex.mu.Unlock()
-
 	e := storage.NewEntryNoExtra(key, value, String, StringSet)
-	if err := db.store(e); err != nil {
-		return err
+	// if err := db.store(e); err != nil {
+	// 	return err
+	// }
+	err = db.manager.WriteEntry(e)
+	if err != nil {
+		return nil
 	}
-
 	// clear expire time.
 	if _, ok := db.expires[String][string(key)]; ok {
 		delete(db.expires[String], string(key))
 	}
 	// set String index info, stored at skip list.
-	db.setIndexer(e)
+	// db.setIndexer(e)
 	return
 }
 
@@ -336,6 +365,10 @@ func (db *RoseDB) setIndexer(e *storage.Entry) {
 }
 
 func (db *RoseDB) getVal(key []byte) ([]byte, error) {
+	exist, en := db.manager.IsInBuffer(key)
+	if exist {
+		return en.Meta.Value, nil
+	}
 	// Get index info from a skip list in memory.
 	node := db.strIndex.idxList.Get(key)
 	if node == nil {
@@ -373,4 +406,56 @@ func (db *RoseDB) getVal(key []byte) ([]byte, error) {
 		return e.Meta.Value, nil
 	}
 	return nil, ErrKeyNotExist
+}
+
+//only for KeyOnlyMemMode,according key get entry
+func (db *RoseDB) getEntryVal(key []byte) (*storage.Entry, error) {
+	// Get index info from a skip list in memory.
+	node := db.strIndex.idxList.Get(key)
+	if node == nil {
+		return nil, ErrKeyNotExist
+	}
+
+	idx := node.Value().(*index.Indexer)
+	if idx == nil {
+		return nil, ErrNilIndexer
+	}
+
+	if db.checkExpired(key, String) {
+		return nil, ErrKeyExpired
+	}
+	df := db.activeFile[String]
+	if idx.FileId != db.activeFileIds[String] {
+		df = db.archFiles[String][idx.FileId]
+	}
+
+	e, err := df.Read(idx.Offset)
+	return e, err
+}
+
+func (db *RoseDB) setValWithBuffer(key, value []byte) (err error) {
+	if err = db.checkKeyValue(key, value); err != nil {
+		return err
+	}
+
+	// If the existed value is the same as the set value, nothing will be done.
+	if db.config.IdxMode == KeyValueMemMode {
+		if existVal, _ := db.Get(key); existVal != nil && bytes.Compare(existVal, value) == 0 {
+			return
+		}
+	}
+
+	db.strIndex.mu.Lock()
+	defer db.strIndex.mu.Unlock()
+
+	e := storage.NewEntryNoExtra(key, value, String, StringSet)
+	err = db.manager.WriteEntry(e)
+	if err != nil {
+		return err
+	}
+	// clear expire time.
+	if _, ok := db.expires[String][string(key)]; ok {
+		delete(db.expires[String], string(key))
+	}
+	return
 }

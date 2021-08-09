@@ -24,7 +24,6 @@ func InitDb() *RoseDB {
 	if err != nil {
 		log.Fatal(err)
 	}
-
 	return db
 }
 

@@ -2,12 +2,13 @@ package rosedb
 
 import (
 	"fmt"
-	"github.com/stretchr/testify/assert"
 	"log"
 	"math/rand"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestRoseDB_Set(t *testing.T) {

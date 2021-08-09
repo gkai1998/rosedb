@@ -96,6 +96,7 @@ type (
 		lockMgr            *LockMgr      // lockMgr controls isolation of read and write.
 		txnMeta            *TxnMeta      // Txn meta info used in transaction.
 		closed             uint32
+		manager            *buffer_pool_manager
 	}
 
 	// ActiveFiles current active files for different data types.
@@ -156,6 +157,7 @@ func Open(config Config) (*RoseDB, error) {
 		expires:       make(Expires),
 		txnMeta:       txnMeta,
 	}
+	db.manager = New_buffer_pool_manager(50, db)
 	for i := 0; i < DataStructureNum; i++ {
 		db.expires[uint16(i)] = make(map[string]int64)
 	}
@@ -191,7 +193,7 @@ func Reopen(path string) (*RoseDB, error) {
 func (db *RoseDB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-
+	db.manager.FlushAllEntry()
 	if err := db.saveConfig(); err != nil {
 		return err
 	}

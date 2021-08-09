@@ -1,10 +1,12 @@
 package storage
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
 	"time"
+	"unsafe"
 )
 
 var (
@@ -16,9 +18,9 @@ var (
 
 const (
 	// KeySize, ValueSize, ExtraSize, crc32 is uint32 type，4 bytes each.
-	// Timestamp 8 bytes, tx 8 bytes, state 2 bytes.
-	// 4 * 4 + 8 + 8 + 2 = 34
-	entryHeaderSize = 34
+	// Timestamp 8 bytes, tx 8 bytes, EntryId 16 bytes, isdirty 1 byte,state 2 bytes.
+	// 4 * 4 + 8 + 16 + 2 + 8  = 50
+	entryHeaderSize = 50
 )
 
 // data structure type of value, support five types now.
@@ -38,6 +40,8 @@ type (
 		crc32     uint32 // Check sum.
 		Timestamp uint64 // Timestamp is the time when entry was written.
 		TxId      uint64 // TxId represents transaction id of an Entry.
+		EntryId   string //EntryId globally represents id of a entry.
+		// Isdirty   bool   //for buffer cache.
 	}
 
 	// Meta meta info.
@@ -51,9 +55,10 @@ type (
 	}
 )
 
-func newInternal(key, value, extra []byte, state uint16, timestamp uint64) *Entry {
+func newInternal(key, value, extra []byte, state uint16, timestamp uint64, entryid string) *Entry {
 	return &Entry{
 		state: state, Timestamp: timestamp,
+		EntryId: entryid,
 		Meta: &Meta{
 			Key:       key,
 			Value:     value,
@@ -65,13 +70,36 @@ func newInternal(key, value, extra []byte, state uint16, timestamp uint64) *Entr
 	}
 }
 
+//bytes Converted to string
+func Bytes2String(b []byte) string {
+	return *(*string)(unsafe.Pointer(&b))
+}
+
+//int Converted to bytes
+func IntToBytes(n uint16) []byte {
+	bytesBuffer := bytes.NewBuffer([]byte{})
+	binary.Write(bytesBuffer, binary.BigEndian, n)
+	return bytesBuffer.Bytes()
+}
+
+//The formation of entryid
+func ToEntryId(key, value []byte, t uint16) string {
+	id_byte := []byte{}
+	id_byte = append(id_byte, key...)
+	id_byte = append(id_byte, value...)
+	id_byte = append(id_byte, IntToBytes(t)...)
+	return Bytes2String(id_byte)
+}
+
 // NewEntry create a new entry.
 func NewEntry(key, value, extra []byte, t, mark uint16) *Entry {
+	var entryid string
 	var state uint16 = 0
 	// set type and mark.
 	state = state | (t << 8)
 	state = state | mark
-	return newInternal(key, value, extra, state, uint64(time.Now().UnixNano()))
+	entryid = ToEntryId(key, value, t)
+	return newInternal(key, value, extra, state, uint64(time.Now().UnixNano()), entryid)
 }
 
 // NewEntryNoExtra create a new entry without extra info.
@@ -82,11 +110,12 @@ func NewEntryNoExtra(key, value []byte, t, mark uint16) *Entry {
 // NewEntryWithExpire create a new Entry with expired info.
 func NewEntryWithExpire(key, value []byte, deadline int64, t, mark uint16) *Entry {
 	var state uint16 = 0
+	var entryid string
 	// set type and mark.
 	state = state | (t << 8)
 	state = state | mark
-
-	return newInternal(key, value, nil, state, uint64(deadline))
+	entryid = ToEntryId(key, value, t)
+	return newInternal(key, value, nil, state, uint64(deadline), entryid)
 }
 
 // NewEntryWithTx create a new Entry with transaction info.
